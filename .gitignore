@@ -1,0 +1,40 @@
+# Ignore virtual environment directories
+venv/
+ENV/
+env/
+.venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# JetBrains IDE project files
+.idea/
+*.iml
+
+# ChromaDB directory
+.chromadb/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Environment variable files
+*.env
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environment (redundant entry for safety)
+.venv/
+
