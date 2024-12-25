@@ -9,8 +9,8 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
 # either express or implied.
 # See the License for the specific language governing permissions
@@ -19,16 +19,16 @@
 
 import os
 import sys
-import time
-import queue
-import threading
+import re
 import getpass
 import shutil
-import re
+import queue
+import threading
+import time
 
 import openai
 
-# prompt_toolkit layout-based imports
+# prompt_toolkit for the radio dialog
 try:
     from prompt_toolkit import prompt
     from prompt_toolkit.application import Application
@@ -39,36 +39,33 @@ try:
     from prompt_toolkit.styles import Style
     from prompt_toolkit.key_binding import KeyBindings
 except ImportError:
-    print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\nprompt_toolkit is missing. Please install it:")
-    print("   pip install prompt_toolkit")
+    print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024")
+    print("prompt_toolkit is missing. Please install it: pip install prompt_toolkit")
     sys.exit(1)
 
-# tqdm for progress
+# tqdm for progress bar
 try:
     from tqdm import tqdm
 except ImportError:
-    print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\ntqdm is missing. Please install it:")
-    print("   pip install tqdm")
+    print("tqdm is missing. Please install it: pip install tqdm")
     sys.exit(1)
 
-# rich for console formatting
+# rich for pretty console output
 try:
     from rich.console import Console
     from rich.markdown import Markdown
 except ImportError:
-    print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\nrich is missing. Please install it:")
-    print("   pip install rich")
+    print("rich is missing. Please install it: pip install rich")
     sys.exit(1)
 
-# openai error
+# Additional error from openai
 from openai import APIError
 
 # tiktoken for token counting
 try:
     import tiktoken
 except ImportError:
-    print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\ntiktoken is missing. Please install it:")
-    print("   pip install tiktoken")
+    print("tiktoken is missing. Please install it: pip install tiktoken")
     sys.exit(1)
 
 # Attempt to import langchain + chroma. Otherwise fallback.
@@ -76,19 +73,10 @@ try:
     from langchain_openai.embeddings import OpenAIEmbeddings
     from langchain_chroma import Chroma
 except ImportError:
-    print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\nFalling back to langchain_community.")
+    print("Falling back to langchain_community.")
     from langchain_community.embeddings import OpenAIEmbeddings
     from langchain_community.vectorstores import Chroma
 
-
-# ------------------------------------------------------------------------------
-# "Prodify" single-screen ask.py that displays a RadioList of .chromadb indexes
-# and three buttons:
-#   1) "Use"   - in green color
-#   2) "Delete" - in red color
-#   3) "Exit"   - ends the program
-# (C) IURII TRUKHIN, yuri@trukhin.com, 2024
-# ------------------------------------------------------------------------------
 console = Console()
 
 NUM_WORKERS = 4
@@ -101,10 +89,14 @@ K = 100
 global_lock = threading.Lock()
 
 
+# ------------------------------------------------------------------------------
+# Utility functions
+# ------------------------------------------------------------------------------
+
 def parse_date_time(index_name: str):
     """
-    Attempt to parse something like "projectName_YYYYmmdd_HHMMSS_guid"
-    and return (projectName, "YYYY-mm-dd HH:MM") or fallback
+    Attempts to parse a string like 'projectName_YYYYmmdd_HHMMSS_guid'
+    and returns (projectName, 'YYYY-mm-dd HH:MM') or a fallback.
     """
     pattern = r"^(?P<name>.+)_(?P<date>\d{8})_(?P<time>\d{6})_(?P<guid>[0-9a-fA-F]+)$"
     match = re.match(pattern, index_name)
@@ -115,22 +107,63 @@ def parse_date_time(index_name: str):
     t = match.group("time")
 
     yyyy = d[0:4]
-    mm   = d[4:6]
-    dd   = d[6:8]
-
-    hh   = t[0:2]
-    mn   = t[2:4]
+    mm = d[4:6]
+    dd = d[6:8]
+    hh = t[0:2]
+    mn = t[2:4]
     return proj, f"{yyyy}-{mm}-{dd} {hh}:{mn}"
 
 
+def parse_file_update_instructions(answer: str):
+    """
+    Detects the following block format in the AI's answer:
+
+      [FILE_UPDATE]
+      filename: ...
+      code:
+      ... updated code ...
+      [/FILE_UPDATE]
+
+    Returns a list of tuples (filename, new_code).
+    """
+    pattern = re.compile(
+        r"\[FILE_UPDATE\]\s*filename:\s*(.+?)\s*code:\s*(.+?)\[\/FILE_UPDATE\]",
+        flags=re.DOTALL
+    )
+    matches = pattern.findall(answer)
+    results = []
+    for fname, code in matches:
+        fname = fname.strip()
+        code = code.strip()
+        results.append((fname, code))
+    return results
+
+
+def update_file_contents(file_path: str, new_content: str):
+    """
+    Overwrites file_path with new_content. Creates directories if needed.
+    """
+    parent_dir = os.path.dirname(file_path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+
+# ------------------------------------------------------------------------------
+# Worker class for handling user queries (Q:)
+# ------------------------------------------------------------------------------
+
 class AskWorker(threading.Thread):
     """
-    Thread for processing user queries (Q:) one at a time:
-      1) Retrieve relevant docs
-      2) Build context prompt
-      3) Send to OpenAI with optional rate-limit retries
-      4) Print the response with code highlighting
+    A worker thread that processes user queries in the background:
+      1) Retrieves relevant documents from retriever
+      2) Builds the context prompt
+      3) Calls OpenAI
+      4) Prints the answer
+      5) Checks for [FILE_UPDATE] instructions and applies them if user confirms
     """
+
     def __init__(self, task_queue, retriever, enc):
         super().__init__()
         self.task_queue = task_queue
@@ -150,14 +183,11 @@ class AskWorker(threading.Thread):
             self.task_queue.task_done()
 
     def process_query(self, query, idx):
-        # Show the question is being processed, do not clear screen
         with global_lock:
-            console.print(
-                f"[bold]\n(Processing question #{idx})[/bold] Q: {query}",
-                style="dim"
-            )
+            console.print(f"\n[bold](Processing question #{idx})[/bold] Q: {query}", style="dim")
 
         with tqdm(total=2, desc=f"Processing question #{idx}", unit="step") as pbar:
+            # 1) Retrieve docs
             docs = []
             try:
                 docs = self.retriever.invoke(query)
@@ -167,6 +197,7 @@ class AskWorker(threading.Thread):
                 return
             pbar.update(1)
 
+            # 2) Build prompt
             system_prefix = "You are a code assistant. Use the provided context:\n\nContext:\n"
             suffix = f"\nQuestion: {query}"
             base_msg = f"{system_prefix}<CONTEXT_PLACEHOLDER>{suffix}"
@@ -185,21 +216,24 @@ class AskWorker(threading.Thread):
 
             user_prompt = f"{system_prefix}{''.join(context_parts)}{suffix}"
 
+            # 3) Call OpenAI
             delay = INITIAL_DELAY
             answer = None
             for attempt in range(MAX_RETRIES):
                 try:
-                    resp = openai.chat.completions.create(
-                        model="o1-preview",
-                        messages=[{"role": "user", "content": user_prompt}]
+                    resp = openai.ChatCompletion.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": user_prompt}],
                     )
                     answer = resp.choices[0].message.content
                     break
                 except APIError as e:
-                    if e.status_code == 429 and attempt < MAX_RETRIES - 1:
+                    # Rate-limit or other issues
+                    if hasattr(e, 'http_status') and e.http_status == 429 and attempt < MAX_RETRIES - 1:
                         with global_lock:
                             console.print(
-                                f"Rate limit (429), waiting {delay:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...",
+                                f"Rate limit (429). Waiting {delay:.1f}s "
+                                f"(attempt {attempt+1}/{MAX_RETRIES})...",
                                 style="bold red"
                             )
                         time.sleep(delay)
@@ -215,26 +249,39 @@ class AskWorker(threading.Thread):
 
             pbar.update(1)
 
-        # Print the answer below the question (still in main scroll buffer)
+        # 4) Print answer
         with global_lock:
             if answer:
-                console.print("[dim]\n=== Ответ ===[/dim]", style="dim")
+                console.print("[dim]\n=== Answer ===[/dim]", style="dim")
                 console.print(Markdown(answer))
-            else:
-                console.print("No answer (something went wrong).", style="bold red")
 
+                # 5) Check for [FILE_UPDATE]
+                updates = parse_file_update_instructions(answer)
+                for fname, new_code in updates:
+                    console.print(
+                        f"\n[bold yellow]AI suggests updating file:[/bold yellow] {fname}",
+                        style="bold yellow"
+                    )
+                    console.print("Proposed new content:\n", style="dim")
+                    console.print(Markdown(f"```\n{new_code}\n```"))
+                    confirm = input("Apply this update? [y/N] ").strip().lower()
+                    if confirm == 'y':
+                        update_file_contents(fname, new_code)
+                        console.print(f"File {fname} has been updated.\n", style="bold green")
+            else:
+                console.print("No answer was returned. Something went wrong.", style="bold red")
+
+
+# ------------------------------------------------------------------------------
+# A simple radio-list dialog
+# ------------------------------------------------------------------------------
 
 def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
     """
-    A custom single-screen dialog that shows:
-      - A RadioList for picking an index
-      - Three buttons: [Use] (green), [Delete] (red), [Exit] (gray -> quits)
-    Returns (selected_index, action):
-      action is "use", "delete", or "exit".
-    If user presses Esc => (None, None)
+    Shows a RadioList with three buttons: [Use] (green), [Delete] (red), [Exit].
+    Returns (selected_index, action) or (None, None) if user presses Esc.
     """
     radio = RadioList(values=values)
-
     result_index = [None]
     result_action = [None]
 
@@ -253,7 +300,6 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
         result_action[0] = "exit"
         get_app().exit()
 
-    # Make "Use" green, "Delete" red, "Exit" normal/gray
     btn_use = Button(text="Use", handler=on_use)
     btn_use.style = "fg:green"
 
@@ -261,7 +307,6 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
     btn_del.style = "fg:red"
 
     btn_exit = Button(text="Exit", handler=on_exit)
-    # no special color
 
     body = HSplit([
         Label(text=title, dont_extend_height=True),
@@ -288,39 +333,40 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
         layout=layout,
         key_bindings=kb,
         style=style or Style(),
-        full_screen=False,  # so we don't clear the entire screen buffer
+        full_screen=False
     )
-
     application.run()
 
-    return (result_index[0], result_action[0])
+    return result_index[0], result_action[0]
 
+
+# ------------------------------------------------------------------------------
+# Main entry point
+# ------------------------------------------------------------------------------
 
 def main():
-    # Do not clear screen, so user can scroll up to see the banner.
     console.print("Prodify: Product assistant in coding", style="bold")
     console.print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\n", style="bold")
 
     # Check or request OPENAI_API_KEY
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if not openai_api_key:
-        console.print("No OPENAI_API_KEY found in environment.", style="bold red")
+        console.print("No OPENAI_API_KEY found in the environment.", style="bold red")
         key = getpass.getpass("Please enter your OpenAI API key (sk-...): ").strip()
         if not key:
             console.print("No API key provided. Exiting.", style="bold red")
             sys.exit(1)
         os.environ["OPENAI_API_KEY"] = key
 
-    openai.api_key = os.environ.get("OPENAI_API_KEY")
+    openai.api_key = os.environ["OPENAI_API_KEY"]
 
     base_dir = ".chromadb"
     if not os.path.isdir(base_dir):
-        console.print("No indexes found in .chromadb.", style="bold red")
+        console.print("No indexes found in .chromadb. Exiting.", style="bold red")
         sys.exit(0)
 
-    # Main loop
+    # Main loop: choosing an index
     while True:
-        # Gather subfolders
         subfolders = []
         for entry in os.scandir(base_dir):
             if entry.is_dir():
@@ -330,8 +376,6 @@ def main():
             break
 
         subfolders.sort()
-
-        # Build the radio list
         radio_values = []
         for folder_name in subfolders:
             proj, dt_str = parse_date_time(folder_name)
@@ -341,27 +385,27 @@ def main():
         index_choice, action = radio_with_three_buttons_dialog(
             title="Choose an index from .chromadb",
             text=(
-                "Use ↑/↓ to move; Enter to select an item.\n"
-                "Then choose [Use], [Delete], or [Exit].\n"
+                "Use ↑/↓ to move, Enter to select an item.\n"
+                "Then click [Use], [Delete], or [Exit].\n"
                 "Press Esc to cancel."
             ),
             values=radio_values,
             style=Style.from_dict({
-                "dialog":            "bg:#ffffff #000000",
-                "dialog.body":       "bg:#ffffff #000000",
-                "dialog.shadow":     "bg:#cccccc",
+                "dialog":       "bg:#ffffff #000000",
+                "dialog.body":  "bg:#ffffff #000000",
+                "dialog.shadow":"bg:#cccccc",
             }),
         )
 
         if index_choice is None or action is None:
-            console.print("\nNo selection made. Exiting.\n", style="bold yellow")
+            console.print("\nNo selection was made. Exiting.\n", style="bold yellow")
             break
 
         chosen_path = os.path.join(base_dir, index_choice)
         console.print(f"You selected: {chosen_path}\n", style="bold")
 
         if action == "use":
-            console.print("loading index for Q&A...", style="dim")
+            console.print("Loading index for Q&A...", style="dim")
             try:
                 embeddings = OpenAIEmbeddings(openai_api_key=openai.api_key)
                 db = Chroma(
@@ -373,7 +417,10 @@ def main():
                 console.print(f"Error loading {chosen_path}: {e}", style="bold red")
                 continue
 
-            retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": K})
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": K}
+            )
             enc = tiktoken.get_encoding("cl100k_base")
 
             task_queue = queue.Queue(maxsize=QUEUE_SIZE)
@@ -383,16 +430,22 @@ def main():
                 w.start()
                 workers.append(w)
 
-            console.print("\nAsk a question about the entire project code base. (Press Ctrl+C to exit):\n", style="dim")
+            console.print(
+                "\n[bold dim]You can now ask questions about the project codebase.[/bold dim]\n"
+                " - Type your question and press Enter.\n"
+                " - Press Ctrl+C to exit.\n",
+                style="dim"
+            )
+
             question_counter = 0
             try:
                 while True:
-                    query = input("Q: ")
-                    if not query.strip():
+                    user_query = input("Q: ")
+                    if not user_query.strip():
                         console.print("[gray]Empty question. Try again or Ctrl+C to exit.[/gray]")
                         continue
                     question_counter += 1
-                    task_queue.put((query, question_counter))
+                    task_queue.put((user_query, question_counter))
             except KeyboardInterrupt:
                 console.print("\nInterrupted by user.\n", style="bold yellow")
 
@@ -405,10 +458,10 @@ def main():
             console.print("Done with Q&A.\n", style="dim")
 
         elif action == "delete":
-            console.print(f"Deleting: {chosen_path}\n", style="bold red")
+            console.print(f"Deleting index folder: {chosen_path}\n", style="bold red")
             try:
                 shutil.rmtree(chosen_path)
-                console.print(f"Deleted index folder: {chosen_path}\n", style="bold red")
+                console.print(f"Deleted: {chosen_path}\n", style="bold red")
             except Exception as e:
                 console.print(f"Error deleting {chosen_path}: {e}", style="bold red")
 
@@ -421,4 +474,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -30,7 +30,7 @@ pip install \
     tiktoken \
     langchain_openai \
     langchain_chroma \
-    langchain_community
+    langchain_community \
 
 echo ""
 echo "============================================================"
