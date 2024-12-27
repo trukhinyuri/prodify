@@ -5,7 +5,7 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 # You may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -26,6 +26,7 @@ import uuid
 import shutil
 import getpass
 import fnmatch
+import hashlib
 
 try:
     from prompt_toolkit import prompt
@@ -57,6 +58,7 @@ try:
     from openai.error import RateLimitError
 except ImportError:
     class RateLimitError(Exception):
+        """Fallback if openai.error.RateLimitError is not available."""
         pass
 
 # Attempt to import LangChain items
@@ -75,35 +77,25 @@ except ImportError:
 console = Console()
 
 # ------------------------------------------------------------------------------
-# GLOBAL SETTINGS: optimized for large repos
+# GLOBAL SETTINGS
 # ------------------------------------------------------------------------------
-
-# Lower concurrency if hitting rate-limit or want to slow cost burn:
 NUM_WORKERS = 4
 QUEUE_SIZE = 1000
-
-# Larger batch size reduces the overhead but watch out for memory usage:
 BATCH_SIZE = 200
-
-# Try fewer retries; or keep the same if you do see a lot of rate limits:
 MAX_RETRIES = 5
-INITIAL_DELAY = 2.0  # start with 2 seconds if 429
+INITIAL_DELAY = 2.0
 
-# Larger chunk size => fewer embedding calls => cheaper and faster overall
-# (but each chunk is bigger and possibly less granular).
 CHUNK_SIZE = 4000
 CHUNK_OVERLAP = 200
-
-# For very large files, skip them entirely:
-MAX_FILE_SIZE_MB = 10  # skip files > 10 MB
+MAX_FILE_SIZE_MB = 10
 
 global_lock = threading.Lock()
 
 
 def load_indexer_ignore_patterns(project_path: str):
     """
-    Loads patterns from .indexerIgnore (if present).
-    Returns (ignore_patterns, ignore_exceptions).
+    Load ignore patterns from a .indexerIgnore file, if present.
+    Lines starting with '!' are exceptions that override the ignore rules.
     """
     ignore_file_path = os.path.join(project_path, ".indexerIgnore")
     if not os.path.isfile(ignore_file_path):
@@ -116,7 +108,6 @@ def load_indexer_ignore_patterns(project_path: str):
         for line in f:
             line = line.strip()
             if not line or line.startswith('#'):
-                # comment or empty
                 continue
             if line.startswith('!'):
                 pattern = line[1:].strip()
@@ -130,7 +121,7 @@ def load_indexer_ignore_patterns(project_path: str):
 
 def is_ignored(rel_path: str, ignore_patterns, ignore_exceptions, debug=False) -> bool:
     """
-    Checks if rel_path should be ignored, using ignore_patterns and ignore_exceptions.
+    Check if a relative path should be ignored, based on the patterns from .indexerIgnore.
     """
     # Exceptions override everything
     for patt in ignore_exceptions:
@@ -151,7 +142,8 @@ def is_ignored(rel_path: str, ignore_patterns, ignore_exceptions, debug=False) -
 
 def is_probably_text_file(filepath, max_bytes=4096, text_ratio=0.8):
     """
-    Reads up to max_bytes from a file to decide if it's text or binary.
+    Basic heuristic: read up to max_bytes from the file and check the fraction
+    of printable chars. If above text_ratio, we consider it text.
     """
     try:
         with open(filepath, "rb") as f:
@@ -169,7 +161,7 @@ def is_probably_text_file(filepath, max_bytes=4096, text_ratio=0.8):
 
 def file_extension_filter():
     """
-    Returns (known_ext, known_no_dot) for quick extension checks.
+    Return recognized code file extensions/names as (known_ext, known_no_dot).
     """
     file_extensions = [
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
@@ -211,15 +203,13 @@ def file_extension_filter():
 
 def is_code_file(file_path, known_extensions, known_no_dot):
     """
-    Decides if the file is code/text or not. If large or not recognized as text => skip.
+    Decide if a file is likely code/text based on size, extension, or text heuristic.
     """
     if os.path.isdir(file_path):
         return False
 
-    # If file is bigger than MAX_FILE_SIZE_MB => skip
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
     if size_mb > MAX_FILE_SIZE_MB:
-        # skip big files
         return False
 
     _, ext = os.path.splitext(file_path)
@@ -231,17 +221,48 @@ def is_code_file(file_path, known_extensions, known_no_dot):
     return is_probably_text_file(file_path)
 
 
+def sha1_of_text(text: str) -> str:
+    """
+    Compute the SHA-1 hash of a string's bytes (for chunk-level hashing).
+    """
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def get_existing_chunks_for_file(db, file_path: str):
+    """
+    Retrieve all chunks from the DB that belong to this file (metadata.source == file_path).
+    Return a dict {chunk_index: (chunkhash, doc_id)} for partial updates.
+    """
+    results = db.get(where={"source": file_path})
+    chunk_map = {}
+    for doc_id, metadata in zip(results["ids"], results["metadatas"]):
+        if not metadata:
+            continue
+        idx = metadata.get("chunk_index", None)
+        chash = metadata.get("chunkhash", None)
+        if idx is None or chash is None:
+            continue
+        chunk_map[int(idx)] = (chash, doc_id)
+    return chunk_map
+
+
+def delete_single_chunk(db, doc_id):
+    """
+    Delete a specific chunk by doc_id. 
+    If doc_id-based deletion is not supported, switch to metadata-based deletion.
+    """
+    db.delete(ids=[doc_id])
+
+
 class Worker(threading.Thread):
     """
-    Worker thread that reads from a queue of file paths, splits them, and adds them to the DB.
+    Worker thread for partial chunk updates. 
+    We skip unchanged chunks and re-embed only new or changed chunks.
     """
-    def __init__(self, task_queue, db, splitter, known_ext, known_no_dot, pbar):
+    def __init__(self, task_queue, db, pbar):
         super().__init__()
         self.task_queue = task_queue
         self.db = db
-        self.splitter = splitter
-        self.known_ext = known_ext
-        self.known_no_dot = known_no_dot
         self.pbar = pbar
         self.batch_chunks = []
         self.batch_size = BATCH_SIZE
@@ -249,45 +270,67 @@ class Worker(threading.Thread):
 
     def run(self):
         while True:
-            file_path = self.task_queue.get()
-            if file_path is None:
+            item = self.task_queue.get()
+            if item is None:
                 self._flush_batch()
                 self.task_queue.task_done()
                 break
 
-            self.process_file(file_path)
+            file_path, splitted_chunks, old_chunk_map = item
+            self.process_file_chunks(file_path, splitted_chunks, old_chunk_map)
             self.task_queue.task_done()
             self.pbar.update(1)
 
-    def process_file(self, file_path):
-        if not is_code_file(file_path, self.known_ext, self.known_no_dot):
-            return
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-        except Exception as e:
-            console.print("[bold]Prodify: Product assistant in coding[/bold]", style="grey50")
-            console.print(f"Error reading {file_path}: {e}", style="red")
-            return
+    def process_file_chunks(self, file_path, splitted_chunks, old_chunk_map):
+        """
+        splitted_chunks: list of (chunk_index, chunk_text)
+        old_chunk_map:   { chunk_index -> (old_chunkhash, doc_id) }
+        """
+        new_indexes = set()
 
-        chunks = self.splitter.split_text(text)
-        for chunk in chunks:
-            self.batch_chunks.append((chunk, {"source": file_path}))
+        for chunk_index, chunk_text in splitted_chunks:
+            new_indexes.add(chunk_index)
+            new_hash = sha1_of_text(chunk_text)
+
+            # If the old chunk has the same hash, skip re-embedding
+            if chunk_index in old_chunk_map:
+                old_hash, old_doc_id = old_chunk_map[chunk_index]
+                if old_hash == new_hash:
+                    continue
+                else:
+                    with global_lock:
+                        delete_single_chunk(self.db, old_doc_id)
+
+            # Add the new chunk
+            metadata = {
+                "source": file_path,
+                "chunk_index": chunk_index,
+                "chunkhash": new_hash
+            }
+            self.batch_chunks.append((chunk_text, metadata))
             if len(self.batch_chunks) >= self.batch_size:
                 self._flush_batch()
+
+        # If the old index had more chunks than the new data, remove those
+        old_indexes = set(old_chunk_map.keys())
+        removed_indexes = old_indexes - new_indexes
+        for idx in removed_indexes:
+            _, old_doc_id = old_chunk_map[idx]
+            with global_lock:
+                delete_single_chunk(self.db, old_doc_id)
 
     def _flush_batch(self):
         if not self.batch_chunks:
             return
 
-        to_add_texts = [c[0] for c in self.batch_chunks]
-        to_add_metas = [c[1] for c in self.batch_chunks]
+        texts = [c[0] for c in self.batch_chunks]
+        metas = [c[1] for c in self.batch_chunks]
 
         delay = INITIAL_DELAY
         for attempt in range(MAX_RETRIES):
             try:
                 with global_lock:
-                    self.db.add_texts(to_add_texts, metadatas=to_add_metas)
+                    self.db.add_texts(texts, metadatas=metas)
                 break
             except RateLimitError:
                 if attempt < MAX_RETRIES - 1:
@@ -306,11 +349,17 @@ class Worker(threading.Thread):
                         style="red"
                     )
                     break
+
         self.total_chunks += len(self.batch_chunks)
         self.batch_chunks.clear()
 
 
 def main():
+    """
+    Main partial-indexing logic:
+      - The index name is now just the project_name.
+      - On re-runs, we reuse ~/.chromadb/{project_name} and do partial updates.
+    """
     console.clear()
     console.print("[bold]Prodify: Product assistant in coding[/bold]", style="green")
     console.print("(C) TRUKHIN IURII, 2024 yuri@trukhin.com", style="dim")
@@ -329,8 +378,8 @@ def main():
 
     try:
         console.print(
-            "[bold]This utility indexes your project into a Chroma DB.[/bold]\n"
-            "It is optimized for large repositories to reduce cost/time.\n"
+            "[bold]This utility indexes your project into a Chroma DB using partial updates.[/bold]\n"
+            "Unchanged chunks remain. Changed/new chunks are re-embedded only.\n"
             "After indexing, you can run ask.py to query the code.\n",
             style="cyan"
         )
@@ -350,22 +399,26 @@ def main():
         print("  ignore_exceptions:", ignore_exceptions)
         print("======================================")
 
-        date_str = time.strftime("%Y%m%d_%H%M%S")
-        guid_str = str(uuid.uuid4())[:8]
-        index_name = f"{project_name}_{date_str}_{guid_str}"
+        # Use ~/.chromadb and create subfolder named exactly as project_name
+        base_dir = os.path.join(os.path.expanduser("~"), ".chromadb")
+        os.makedirs(base_dir, exist_ok=True)
 
-        persist_dir = os.path.join(".chromadb", index_name)
+        # index_name is now just the project_name
+        index_name = project_name
+
+        persist_dir = os.path.join(base_dir, index_name)
         os.makedirs(persist_dir, exist_ok=True)
 
         console.print(
             f"Selected project path: [light_sky_blue1]{project_path}[/light_sky_blue1]\n"
-            f"Creating new index folder: [spring_green2]{persist_dir}[/spring_green2]\n",
+            f"Index folder: [spring_green2]{persist_dir}[/spring_green2]\n",
             style="bold"
         )
 
-        # If you want a cheaper or self-hosted embeddings approach,
-        # replace OpenAIEmbeddings with a local or smaller model.
-        embeddings = OpenAIEmbeddings(openai_api_key=os.environ["OPENAI_API_KEY"])
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-large",
+            openai_api_key=os.environ["OPENAI_API_KEY"],
+        )
         db = Chroma(
             collection_name=index_name,
             persist_directory=persist_dir,
@@ -378,18 +431,15 @@ def main():
         )
         known_ext, known_no_dot = file_extension_filter()
 
-        console.print("Counting files to index...", style="bold")
-        file_count = 0
+        console.print("Collecting files for partial indexing...", style="bold")
         file_paths = []
+        total_files_to_process = 0
 
-        # Collect all files, skipping .indexerIgnore patterns or large binary files
         for root, dirs, files in os.walk(project_path):
             relative_root = os.path.relpath(root, project_path).replace("\\", "/")
             if relative_root == ".":
                 relative_root = ""
 
-            # If you want to skip known large folders (like .idea, .git, build, out),
-            # you can remove them here or rely on .indexerIgnore
             for d in list(dirs):
                 d_path = os.path.join(relative_root, d).replace("\\", "/")
                 if is_ignored(d_path + "/", ignore_patterns, ignore_exceptions):
@@ -400,33 +450,60 @@ def main():
                 full_path = os.path.join(root, filename)
                 rel_file_path = os.path.join(relative_root, filename).replace("\\", "/")
                 if is_ignored(rel_file_path, ignore_patterns, ignore_exceptions):
-                    # console.print(f"Skipping file: {rel_file_path}", style="dim")
+                    continue
+
+                if not is_code_file(full_path, known_ext, known_no_dot):
                     continue
 
                 file_paths.append(full_path)
-                file_count += 1
+                total_files_to_process += 1
+
+        if total_files_to_process == 0:
+            console.print("No indexable files found. Exiting.", style="bold red")
+            indexing_in_progress = False
+            return
 
         console.print(
-            f"Found [light_yellow]{file_count}[/light_yellow] files to index.\n",
+            f"Found [light_yellow]{total_files_to_process}[/light_yellow] files to process.\n",
             style="bold"
         )
 
+        # Prepare tasks: each file => splitted chunks, old chunk map
+        tasks = []
+
+        console.print("Preparing partial updates for each file...", style="bold")
+        for fpath in tqdm(file_paths, desc="Prep", unit="file"):
+            old_chunk_map = get_existing_chunks_for_file(db, fpath)
+
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except Exception as e:
+                console.print(f"Error reading {fpath}: {e}", style="red")
+                continue
+
+            splitted = []
+            chunks = splitter.split_text(text)
+            for i, chunk_text in enumerate(chunks):
+                splitted.append((i, chunk_text))
+
+            tasks.append((fpath, splitted, old_chunk_map))
+
+        console.print("Starting worker threads for partial chunk updates...\n", style="bold")
+
         task_queue = queue.Queue(maxsize=QUEUE_SIZE)
-
-        console.print("Starting worker threads for indexing...\n", style="bold")
-
-        pbar = tqdm(total=file_count, desc="Indexing files", unit="file")
+        pbar = tqdm(total=len(tasks), desc="Indexing files", unit="file")
         workers = []
+
         for _ in range(NUM_WORKERS):
-            w = Worker(task_queue, db, splitter, known_ext, known_no_dot, pbar)
+            w = Worker(task_queue, db, pbar)
             w.start()
             workers.append(w)
 
-        # Enqueue file paths
-        for fpath in file_paths:
-            task_queue.put(fpath)
+        for item in tasks:
+            task_queue.put(item)
 
-        # Signal the end
+        # Signal end
         for _ in range(NUM_WORKERS):
             task_queue.put(None)
 
@@ -436,8 +513,8 @@ def main():
         pbar.close()
 
         console.print(
-            f"Indexing complete!\n"
-            f"New index: [khaki1]{index_name}[/khaki1]\n"
+            f"Partial indexing complete!\n"
+            f"Index name: [khaki1]{index_name}[/khaki1]\n"
             f"Stored in: [spring_green2]{persist_dir}[/spring_green2]\n",
             style="bold"
         )
@@ -446,16 +523,19 @@ def main():
 
     except KeyboardInterrupt:
         console.print("\nIndexing interrupted by user.", style="bold red")
-        if indexing_in_progress and persist_dir and os.path.isdir(persist_dir):
-            console.print(f"Removing incomplete index folder: {persist_dir}", style="bold red")
-            shutil.rmtree(persist_dir, ignore_errors=True)
+        # If incomplete, do NOT remove the entire folder if we want partial updates later
+        # (But if you prefer cleaning up, uncomment below)
+        # if indexing_in_progress and persist_dir and os.path.isdir(persist_dir):
+        #     console.print(f"Removing incomplete index folder: {persist_dir}", style="bold red")
+        #     shutil.rmtree(persist_dir, ignore_errors=True)
         sys.exit(1)
 
     except Exception as e:
         console.print(f"\nAn error occurred: {e}", style="bold red")
-        if indexing_in_progress and persist_dir and os.path.isdir(persist_dir):
-            console.print(f"Removing incomplete index folder: {persist_dir}", style="bold red")
-            shutil.rmtree(persist_dir, ignore_errors=True)
+        # Same logic about cleanup; can be commented out if partial data is still useful
+        # if indexing_in_progress and persist_dir and os.path.isdir(persist_dir):
+        #     console.print(f"Removing incomplete index folder: {persist_dir}", style="bold red")
+        #     shutil.rmtree(persist_dir, ignore_errors=True)
         sys.exit(1)
 
 
