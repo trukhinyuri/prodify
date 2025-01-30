@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # ------------------------------------------------------------------------------
 # Prodify: Product assistant in coding
 # (C) IURII TRUKHIN, yuri@trukhin.com, 2024
@@ -9,22 +10,13 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
 # either express or implied.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 # ------------------------------------------------------------------------------
-
-"""
-We have released a new major version of our SDK, and we recommend upgrading promptly.
-
-It's a total rewrite of the library, so many things have changed, but we've made upgrading easy with a
-code migration script and detailed docs below. It was extensively beta tested prior to release.
-
-( ... Migration details ... )
-"""
 
 import os
 import sys
@@ -43,7 +35,7 @@ try:
     from prompt_toolkit.application import Application
     from prompt_toolkit.application.current import get_app
     from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
+    from prompt_toolkit.layout.containers import HSplit, VSplit, Window
     from prompt_toolkit.widgets import Dialog, Button, Label, RadioList
     from prompt_toolkit.styles import Style
     from prompt_toolkit.key_binding import KeyBindings
@@ -85,41 +77,38 @@ console = Console()
 NUM_WORKERS = 4
 QUEUE_SIZE = 100
 
-# For o1-mini, we allow up to 16384 tokens
+# We'll keep a high token limit, e.g. 16384
 MAX_TOKENS = 16384
-
 MAX_RETRIES = 5
 INITIAL_DELAY = 1.0
+
+# Number of chunks from Chroma
 K = 100
 
-global_lock = threading.Lock()
-
-##############################################################################
-# Conversation + Document History
-##############################################################################
-
-# We keep the entire conversation in memory. Each user query + assistant answer is appended.
+# Global conversation context
 conversation = [
     {
         "role": "user",
         "content": (
-            "You are a code assistant using the maximum context possible (16384 tokens). "
-            "You remember all previous user queries and your answers. "
-            "Answer as helpfully as possible."
+            "You are a coding assistant with a large context window. Keep track of previous code fragments and questions. "
+            "Provide detailed and thorough responses."
         )
     }
 ]
 
-# We also keep a list of document contexts from previous requests.
-# Each entry is a string of concatenated doc context from a single request.
+# We store retrieved docs here; used if user types "continue"
 doc_history = []
 
+global_lock = threading.Lock()
 
-def prune_conversation_if_needed(conversation_list, enc, model="o1-mini"):
+
+##############################################################################
+# Prune conversation
+##############################################################################
+def prune_conversation_if_needed(conversation_list, enc):
     """
-    If the conversation is too large (potentially exceeding the token limit),
-    gradually remove the oldest user/assistant messages (but not the first user message).
-    This is a simplified logic: we remove entire messages from the start.
+    If total tokens in the conversation exceed MAX_TOKENS,
+    remove oldest user/assistant messages (but not the very first user message).
     """
     while True:
         total_tokens = 0
@@ -128,7 +117,6 @@ def prune_conversation_if_needed(conversation_list, enc, model="o1-mini"):
         if total_tokens <= MAX_TOKENS:
             break
 
-        # Remove the earliest user/assistant message except the very first user message
         to_remove = None
         for i, msg in enumerate(conversation_list):
             if msg["role"] in ("user", "assistant") and i > 0:
@@ -140,27 +128,14 @@ def prune_conversation_if_needed(conversation_list, enc, model="o1-mini"):
 
 
 ##############################################################################
-# Utility functions
+# File update instructions
 ##############################################################################
-
-def parse_date_time(index_name: str):
-    pattern = r"^(?P<name>.+)_(?P<date>\d{8})_(?P<time>\d{6})_(?P<guid>[0-9a-fA-F]+)$"
-    match = re.match(pattern, index_name)
-    if not match:
-        return index_name, ""
-    proj = match.group("name") or "project"
-    d = match.group("date")
-    t = match.group("time")
-
-    yyyy = d[0:4]
-    mm = d[4:6]
-    dd = d[6:8]
-    hh = t[0:2]
-    mn = t[2:4]
-    return proj, f"{yyyy}-{mm}-{dd} {hh}:{mn}"
-
-
 def parse_file_update_instructions(answer: str):
+    """
+    Look for blocks like:
+      [FILE_UPDATE] filename: <...> code: <...> [/FILE_UPDATE]
+    Return list of (filename, code).
+    """
     pattern = re.compile(
         r"\[FILE_UPDATE\]\s*filename:\s*(.+?)\s*code:\s*(.+?)\[\/FILE_UPDATE\]",
         flags=re.DOTALL
@@ -183,17 +158,9 @@ def update_file_contents(file_path: str, new_content: str):
 
 
 ##############################################################################
-# AskWorker
+# Worker for Q&A
 ##############################################################################
-
 class AskWorker(threading.Thread):
-    """
-    Worker thread:
-      - If user says "continue"/"продолжи", then we reuse *all previous doc contexts* (doc_history).
-      - Otherwise, we retrieve new docs and store them in doc_history as well.
-      - Combine doc_history with conversation, build prompt, call openai.chat.completions.create.
-      - Save the user+assistant messages in the conversation.
-    """
     def __init__(self, task_queue, retriever, enc):
         super().__init__()
         self.task_queue = task_queue
@@ -214,85 +181,76 @@ class AskWorker(threading.Thread):
 
     def process_query(self, query, idx):
         with global_lock:
-            console.print(f"\n[bold](Processing question #{idx})[/bold] Q: {query}", style="dim")
+            console.print(f"\n[bold](Q#{idx})[/bold] Your question: {query}", style="dim")
 
-        with tqdm(total=2, desc=f"Processing question #{idx}", unit="step") as pbar:
-            # Check if user just wants to continue
-            skip_retrieval = query.strip().lower() in ["continue", "продолжи"]
+        with tqdm(total=2, desc=f"Q#{idx}", unit="step") as pbar:
+            skip_retrieval = query.strip().lower() == "continue"
 
             if skip_retrieval:
-                # Reuse all doc contexts from doc_history
+                # Reuse doc_history
                 combined_docs_text = "\n".join(doc_history)
                 pbar.update(1)
             else:
-                # Retrieve new docs
+                # Retrieve new docs from Chroma
                 docs = []
                 try:
                     docs = self.retriever.invoke(query)
                 except Exception as e:
                     with global_lock:
-                        console.print(f"Error retrieving docs: {e}", style="bold red")
+                        console.print(f"Error retrieving from Chroma: {e}", style="bold red")
                     return
                 pbar.update(1)
 
-                # Build doc context from these docs
                 doc_context = []
                 total_doc_tokens = 0
                 for i, doc in enumerate(docs, start=1):
                     source = doc.metadata.get("source", "unknown")
-                    piece = f"--- document {i} source: {source} ---\n{doc.page_content}\n\n"
+                    piece = f"--- document {i} | source: {source} ---\n{doc.page_content}\n\n"
                     piece_tokens = len(self.enc.encode(piece))
                     if total_doc_tokens + piece_tokens > MAX_TOKENS:
                         break
                     doc_context.append(piece)
                     total_doc_tokens += piece_tokens
-                new_docs_text = "".join(doc_context)
 
-                # Append to doc_history
+                new_docs_text = "".join(doc_context)
                 if new_docs_text.strip():
                     doc_history.append(new_docs_text)
 
-                # Combine all doc_history
                 combined_docs_text = "\n".join(doc_history)
 
-            # Build temporary conversation
             with global_lock:
                 temp_convo = list(conversation)
-
-                # Add doc context (all from doc_history if any)
                 if combined_docs_text.strip():
                     temp_convo.append({
                         "role": "user",
-                        "content": f"Relevant code context (all previous docs):\n{combined_docs_text}"
+                        "content": f"Here are the retrieved code fragments:\n{combined_docs_text}"
                     })
 
-                # The user's new query
                 temp_convo.append({"role": "user", "content": query})
+                prune_conversation_if_needed(temp_convo, self.enc)
 
-                prune_conversation_if_needed(temp_convo, self.enc, model="o1-mini")
-
-            # Call openai
+            # Use openai.chat.completions.create (>=1.0.0)
             answer = None
             delay = INITIAL_DELAY
             for attempt in range(MAX_RETRIES):
                 try:
                     resp = openai.chat.completions.create(
-                        model="o1-mini",
+                        model="o1-preview",  # The strongest model available if your key has access
                         messages=temp_convo,
                     )
                     answer = resp.choices[0].message.content
                     break
-                except RateLimitError as e:
+                except RateLimitError:
                     if attempt < MAX_RETRIES - 1:
                         console.print(
-                            f"Rate limit. Waiting {delay:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...",
+                            f"Rate limit encountered. Sleeping {delay:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...",
                             style="bold red"
                         )
                         time.sleep(delay)
                         delay *= 2
                     else:
                         with global_lock:
-                            console.print(f"RateLimitError: {e}", style="bold red")
+                            console.print("RateLimitError: max retries exceeded.", style="bold red")
                         return
                 except OpenAIError as e:
                     with global_lock:
@@ -302,6 +260,7 @@ class AskWorker(threading.Thread):
                     with global_lock:
                         console.print(f"Unexpected error: {e}", style="bold red")
                     return
+
             pbar.update(1)
 
         with global_lock:
@@ -309,41 +268,29 @@ class AskWorker(threading.Thread):
                 console.print("[dim]\n=== Answer ===[/dim]", style="dim")
                 console.print(Markdown(answer))
 
-                # Check for [FILE_UPDATE]
+                # Check for file update blocks
                 updates = parse_file_update_instructions(answer)
                 for fname, new_code in updates:
-                    console.print(
-                        f"\n[bold yellow]AI suggests updating file:[/bold yellow] {fname}",
-                        style="bold yellow"
-                    )
-                    console.print("Proposed new content:\n", style="dim")
+                    console.print(f"\n[bold yellow]AI suggests updating file:[/bold yellow] {fname}")
+                    console.print("Proposed content:\n", style="dim")
                     console.print(Markdown(f"```\n{new_code}\n```"))
-                    confirm = input("Apply this update? [y/N] ").strip().lower()
+                    confirm = input("Apply this change? [y/N] ").strip().lower()
                     if confirm == 'y':
                         update_file_contents(fname, new_code)
-                        console.print(f"File {fname} has been updated.\n", style="bold green")
+                        console.print(f"File {fname} updated.\n", style="bold green")
 
-                # Store user+assistant messages in global conversation
+                # Update global conversation
                 conversation.append({"role": "user", "content": query})
                 conversation.append({"role": "assistant", "content": answer})
-                prune_conversation_if_needed(conversation, self.enc, model="o1-mini")
+                prune_conversation_if_needed(conversation, self.enc)
             else:
-                console.print("No answer was returned. Something went wrong.", style="bold red")
+                console.print("No answer returned. Something went wrong.", style="bold red")
 
 
 ##############################################################################
-# A simple radio-list dialog
+# Dialog for choosing folder in ~/.chromadb
 ##############################################################################
-
 def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
-    from prompt_toolkit.widgets import Dialog, Button, Label, RadioList
-    from prompt_toolkit.layout.containers import HSplit
-    from prompt_toolkit.styles import Style
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.layout import Layout
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.application.current import get_app
-
     radio = RadioList(values=values)
     result_index = [None]
     result_action = [None]
@@ -364,11 +311,7 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
         get_app().exit()
 
     btn_use = Button(text="Use", handler=on_use)
-    btn_use.style = "fg:green"
-
     btn_del = Button(text="Delete", handler=on_delete)
-    btn_del.style = "fg:red"
-
     btn_exit = Button(text="Exit", handler=on_exit)
 
     body = HSplit([
@@ -380,10 +323,20 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
     dialog = Dialog(
         body=body,
         buttons=[btn_use, btn_del, btn_exit],
-        with_background=False
+        with_background=True,
     )
 
     kb = KeyBindings()
+
+    @kb.add("up")
+    def move_up(event):
+        if event.app.layout.has_focus(radio):
+            radio.selected_index = (radio.selected_index - 1) % len(radio.values)
+
+    @kb.add("down")
+    def move_down(event):
+        if event.app.layout.has_focus(radio):
+            radio.selected_index = (radio.selected_index + 1) % len(radio.values)
 
     @kb.add("escape")
     def _(event):
@@ -396,7 +349,7 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
         layout=layout,
         key_bindings=kb,
         style=style or Style(),
-        full_screen=False
+        full_screen=True
     )
     application.run()
 
@@ -404,19 +357,18 @@ def radio_with_three_buttons_dialog(title: str, text: str, values, style=None):
 
 
 ##############################################################################
-# Main entry point
+# MAIN
 ##############################################################################
-
 def main():
     console.print("Prodify: Product assistant in coding", style="bold")
     console.print("(C) IURII TRUKHIN, yuri@trukhin.com, 2024\n", style="bold")
 
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if not openai_api_key:
-        console.print("No OPENAI_API_KEY found in the environment.", style="bold red")
+        console.print("Environment variable OPENAI_API_KEY not found.", style="bold red")
         key = getpass.getpass("Please enter your OpenAI API key (sk-...): ").strip()
         if not key:
-            console.print("No API key provided. Exiting.", style="bold red")
+            console.print("No API key. Exiting.", style="bold red")
             sys.exit(1)
         os.environ["OPENAI_API_KEY"] = key
 
@@ -425,43 +377,32 @@ def main():
     base_dir = os.path.join(os.path.expanduser("~"), ".chromadb")
     os.makedirs(base_dir, exist_ok=True)
 
-    if not os.path.isdir(base_dir):
+    # Find subfolders in ~/.chromadb
+    subfolders = [entry.name for entry in os.scandir(base_dir) if entry.is_dir()]
+    if not subfolders:
         console.print("No indexes found in ~/.chromadb. Exiting.", style="bold red")
         sys.exit(0)
 
     while True:
-        subfolders = []
-        for entry in os.scandir(base_dir):
-            if entry.is_dir():
-                subfolders.append(entry.name)
-        if not subfolders:
-            console.print("No indexes found. Exiting.", style="bold red")
-            break
-
         subfolders.sort()
-        radio_values = []
-        for folder_name in subfolders:
-            proj, dt_str = parse_date_time(folder_name)
-            label = f"{proj} ({dt_str})" if dt_str else folder_name
-            radio_values.append((folder_name, label))
+        radio_values = [(folder_name, folder_name) for folder_name in subfolders]
 
         index_choice, action = radio_with_three_buttons_dialog(
-            title="Choose an index from ~/.chromadb",
+            title="Select an index from ~/.chromadb",
             text=(
-                "Use ↑/↓ to move, Enter to select an item.\n"
-                "Then click [Use], [Delete], or [Exit].\n"
-                "Press Esc to cancel."
+                "Use up/down to move, Enter to focus buttons.\n"
+                "Choose 'Use' to open the index, 'Delete' to remove it, or 'Exit' to quit."
             ),
             values=radio_values,
             style=Style.from_dict({
-                "dialog":       "bg:#ffffff #000000",
-                "dialog.body":  "bg:#ffffff #000000",
-                "dialog.shadow":"bg:#cccccc",
+                "dialog":        "bg:#ffffff #000000",
+                "dialog.body":   "bg:#ffffff #000000",
+                "dialog.shadow": "bg:#aaaaaa",
             }),
         )
 
         if index_choice is None or action is None:
-            console.print("\nNo selection was made. Exiting.\n", style="bold yellow")
+            console.print("\nNo selection made. Exiting.\n", style="bold yellow")
             break
 
         chosen_path = os.path.join(base_dir, index_choice)
@@ -471,7 +412,7 @@ def main():
             console.print("Loading index for Q&A...", style="dim")
             try:
                 embeddings = OpenAIEmbeddings(
-                    model="text-embedding-3-large",
+                    model="text-embedding-ada-002",
                     openai_api_key=openai.api_key,
                 )
                 db = Chroma(
@@ -483,10 +424,7 @@ def main():
                 console.print(f"Error loading {chosen_path}: {e}", style="bold red")
                 continue
 
-            retriever = db.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": K}
-            )
+            retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": K})
             enc = tiktoken.get_encoding("cl100k_base")
 
             task_queue = queue.Queue(maxsize=QUEUE_SIZE)
@@ -497,9 +435,9 @@ def main():
                 workers.append(w)
 
             console.print(
-                "\n[bold dim]You can now ask questions about the project codebase.[/bold dim]\n"
+                "\nAsk questions about your code below.\n"
                 " - Type your question and press Enter.\n"
-                " - Type 'continue' or 'продолжи' to reuse all previous doc contexts.\n"
+                " - Type 'continue' to reuse previous doc context.\n"
                 " - Press Ctrl+C to exit.\n",
                 style="dim"
             )
@@ -509,32 +447,33 @@ def main():
                 while True:
                     user_query = input("Q: ")
                     if not user_query.strip():
-                        console.print("[gray]Empty question. Try again or Ctrl+C to exit.[/gray]")
+                        console.print("[gray]Empty query. Please try again or Ctrl+C to exit.[/gray]")
                         continue
                     question_counter += 1
                     task_queue.put((user_query, question_counter))
             except KeyboardInterrupt:
-                console.print("\nInterrupted by user.\n", style="bold yellow")
+                console.print("\nQ&A session ended (Ctrl+C).\n", style="bold yellow")
 
-            # signal the workers to end
+            # Signal end
             for _ in range(NUM_WORKERS):
                 task_queue.put(None)
             task_queue.join()
             for w in workers:
                 w.join()
 
-            console.print("Done with Q&A.\n", style="dim")
+            console.print("Done with Q&A session.\n", style="dim")
 
         elif action == "delete":
             console.print(f"Deleting index folder: {chosen_path}\n", style="bold red")
             try:
                 shutil.rmtree(chosen_path)
                 console.print(f"Deleted: {chosen_path}\n", style="bold red")
+                subfolders.remove(index_choice)
             except Exception as e:
                 console.print(f"Error deleting {chosen_path}: {e}", style="bold red")
 
         elif action == "exit":
-            console.print("Exiting program.\n", style="bold yellow")
+            console.print("Exiting the program.\n", style="bold yellow")
             sys.exit(0)
 
     console.print("\nAll done!\n", style="dim")

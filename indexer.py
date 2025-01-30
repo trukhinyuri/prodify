@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # ------------------------------------------------------------------------------
 # Prodify: Product assistant in coding
 # (C) TRUKHIN IURII, 2024 yuri@trukhin.com
@@ -9,8 +10,8 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
 # either express or implied.
 # See the License for the specific language governing permissions
@@ -91,11 +92,14 @@ MAX_FILE_SIZE_MB = 10
 
 global_lock = threading.Lock()
 
-
+# ------------------------------------------------------------------------------
+# IGNORE LOGIC
+# ------------------------------------------------------------------------------
 def load_indexer_ignore_patterns(project_path: str):
     """
-    Load ignore patterns from a .indexerIgnore file, if present.
-    Lines starting with '!' are exceptions that override the ignore rules.
+    Load patterns from the .indexerIgnore file if it exists in the project root.
+    Lines starting with '!' are exceptions (do not ignore),
+    and lines without '!' are patterns to ignore.
     """
     ignore_file_path = os.path.join(project_path, ".indexerIgnore")
     if not os.path.isfile(ignore_file_path):
@@ -121,16 +125,17 @@ def load_indexer_ignore_patterns(project_path: str):
 
 def is_ignored(rel_path: str, ignore_patterns, ignore_exceptions, debug=False) -> bool:
     """
-    Check if a relative path should be ignored, based on the patterns from .indexerIgnore.
+    Determine if a file or directory (rel_path) should be ignored
+    based on the .indexerIgnore patterns.
     """
-    # Exceptions override everything
+    # First, check exceptions (if it matches an exception, do not ignore).
     for patt in ignore_exceptions:
         if fnmatch.fnmatch(rel_path, patt):
             if debug:
                 print(f"EXCEPTION match: {patt} => do NOT ignore {rel_path}")
             return False
 
-    # If any ignore pattern matches => ignore
+    # If it matches any ignore pattern, ignore it.
     for patt in ignore_patterns:
         if fnmatch.fnmatch(rel_path, patt):
             if debug:
@@ -139,11 +144,14 @@ def is_ignored(rel_path: str, ignore_patterns, ignore_exceptions, debug=False) -
 
     return False
 
-
+# ------------------------------------------------------------------------------
+# FILE TYPE DETECTION
+# ------------------------------------------------------------------------------
 def is_probably_text_file(filepath, max_bytes=4096, text_ratio=0.8):
     """
-    Basic heuristic: read up to max_bytes from the file and check the fraction
-    of printable chars. If above text_ratio, we consider it text.
+    Basic heuristic to determine if a file is text:
+    Read up to max_bytes and check the fraction of printable characters.
+    If ratio exceeds text_ratio, treat it as a text file.
     """
     try:
         with open(filepath, "rb") as f:
@@ -161,7 +169,7 @@ def is_probably_text_file(filepath, max_bytes=4096, text_ratio=0.8):
 
 def file_extension_filter():
     """
-    Return recognized code file extensions/names as (known_ext, known_no_dot).
+    List of commonly used file extensions for code and config files.
     """
     file_extensions = [
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
@@ -203,7 +211,8 @@ def file_extension_filter():
 
 def is_code_file(file_path, known_extensions, known_no_dot):
     """
-    Decide if a file is likely code/text based on size, extension, or text heuristic.
+    Check if a file is potentially source code or textual content.
+    Skips large files, and also does a text heuristic.
     """
     if os.path.isdir(file_path):
         return False
@@ -220,18 +229,20 @@ def is_code_file(file_path, known_extensions, known_no_dot):
 
     return is_probably_text_file(file_path)
 
-
+# ------------------------------------------------------------------------------
+# UTILS
+# ------------------------------------------------------------------------------
 def sha1_of_text(text: str) -> str:
     """
-    Compute the SHA-1 hash of a string's bytes (for chunk-level hashing).
+    Compute the SHA-1 hash of the given text (UTF-8, ignoring errors).
     """
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def get_existing_chunks_for_file(db, file_path: str):
     """
-    Retrieve all chunks from the DB that belong to this file (metadata.source == file_path).
-    Return a dict {chunk_index: (chunkhash, doc_id)} for partial updates.
+    Retrieve all chunks that belong to this file (metadata.source == file_path)
+    and return a dict {chunk_index: (chunkhash, doc_id)} for comparison during updates.
     """
     results = db.get(where={"source": file_path})
     chunk_map = {}
@@ -248,16 +259,20 @@ def get_existing_chunks_for_file(db, file_path: str):
 
 def delete_single_chunk(db, doc_id):
     """
-    Delete a specific chunk by doc_id. 
-    If doc_id-based deletion is not supported, switch to metadata-based deletion.
+    Delete a single document (chunk) from Chroma by doc_id.
     """
     db.delete(ids=[doc_id])
 
 
+# ------------------------------------------------------------------------------
+# Worker
+# ------------------------------------------------------------------------------
 class Worker(threading.Thread):
     """
-    Worker thread for partial chunk updates. 
-    We skip unchanged chunks and re-embed only new or changed chunks.
+    A worker thread that processes file chunks for partial updates:
+      - If chunk is unchanged, skip.
+      - If changed, re-embed and update.
+      - If there are extra chunks in the old version, remove them.
     """
     def __init__(self, task_queue, db, pbar):
         super().__init__()
@@ -282,26 +297,23 @@ class Worker(threading.Thread):
             self.pbar.update(1)
 
     def process_file_chunks(self, file_path, splitted_chunks, old_chunk_map):
-        """
-        splitted_chunks: list of (chunk_index, chunk_text)
-        old_chunk_map:   { chunk_index -> (old_chunkhash, doc_id) }
-        """
         new_indexes = set()
 
         for chunk_index, chunk_text in splitted_chunks:
             new_indexes.add(chunk_index)
             new_hash = sha1_of_text(chunk_text)
 
-            # If the old chunk has the same hash, skip re-embedding
+            # If old chunk exists and hash is the same, skip re-embedding
             if chunk_index in old_chunk_map:
                 old_hash, old_doc_id = old_chunk_map[chunk_index]
                 if old_hash == new_hash:
                     continue
                 else:
+                    # Hash changed => remove the old chunk
                     with global_lock:
                         delete_single_chunk(self.db, old_doc_id)
 
-            # Add the new chunk
+            # Add the new chunk to the batch
             metadata = {
                 "source": file_path,
                 "chunk_index": chunk_index,
@@ -311,7 +323,7 @@ class Worker(threading.Thread):
             if len(self.batch_chunks) >= self.batch_size:
                 self._flush_batch()
 
-        # If the old index had more chunks than the new data, remove those
+        # Remove chunks that no longer exist in the new text
         old_indexes = set(old_chunk_map.keys())
         removed_indexes = old_indexes - new_indexes
         for idx in removed_indexes:
@@ -354,12 +366,10 @@ class Worker(threading.Thread):
         self.batch_chunks.clear()
 
 
+# ------------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------------
 def main():
-    """
-    Main partial-indexing logic:
-      - The index name is now just the project_name.
-      - On re-runs, we reuse ~/.chromadb/{project_name} and do partial updates.
-    """
     console.clear()
     console.print("[bold]Prodify: Product assistant in coding[/bold]", style="green")
     console.print("(C) TRUKHIN IURII, 2024 yuri@trukhin.com", style="dim")
@@ -378,9 +388,9 @@ def main():
 
     try:
         console.print(
-            "[bold]This utility indexes your project into a Chroma DB using partial updates.[/bold]\n"
-            "Unchanged chunks remain. Changed/new chunks are re-embedded only.\n"
-            "After indexing, you can run ask.py to query the code.\n",
+            "[bold]This script indexes your project into a Chroma DB with partial updates.[/bold]\n"
+            "Unchanged chunks are skipped, while new or modified chunks are re-embedded.\n"
+            "After indexing, you can run [italic]ask.py[/italic] to query your code.\n",
             style="cyan"
         )
 
@@ -399,24 +409,23 @@ def main():
         print("  ignore_exceptions:", ignore_exceptions)
         print("======================================")
 
-        # Use ~/.chromadb and create subfolder named exactly as project_name
+        # Use ~/.chromadb/PROJECT_NAME to store the index
         base_dir = os.path.join(os.path.expanduser("~"), ".chromadb")
         os.makedirs(base_dir, exist_ok=True)
 
-        # index_name is now just the project_name
         index_name = project_name
-
         persist_dir = os.path.join(base_dir, index_name)
         os.makedirs(persist_dir, exist_ok=True)
 
         console.print(
-            f"Selected project path: [light_sky_blue1]{project_path}[/light_sky_blue1]\n"
+            f"Selected project: [light_sky_blue1]{project_path}[/light_sky_blue1]\n"
             f"Index folder: [spring_green2]{persist_dir}[/spring_green2]\n",
             style="bold"
         )
 
+        # Create/load the Chroma DB
         embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-large",
+            model="text-embedding-ada-002",
             openai_api_key=os.environ["OPENAI_API_KEY"],
         )
         db = Chroma(
@@ -440,12 +449,14 @@ def main():
             if relative_root == ".":
                 relative_root = ""
 
+            # Filter out ignored subdirectories
             for d in list(dirs):
                 d_path = os.path.join(relative_root, d).replace("\\", "/")
                 if is_ignored(d_path + "/", ignore_patterns, ignore_exceptions):
                     console.print(f"Skipping directory: {d_path + '/'}", style="dim")
                     dirs.remove(d)
 
+            # Filter out ignored files
             for filename in files:
                 full_path = os.path.join(root, filename)
                 rel_file_path = os.path.join(relative_root, filename).replace("\\", "/")
@@ -459,7 +470,7 @@ def main():
                 total_files_to_process += 1
 
         if total_files_to_process == 0:
-            console.print("No indexable files found. Exiting.", style="bold red")
+            console.print("No suitable files found for indexing. Exiting.", style="bold red")
             indexing_in_progress = False
             return
 
@@ -468,11 +479,10 @@ def main():
             style="bold"
         )
 
-        # Prepare tasks: each file => splitted chunks, old chunk map
+        # Prepare tasks for each file (split into chunks, fetch old chunks)
         tasks = []
-
-        console.print("Preparing partial updates for each file...", style="bold")
-        for fpath in tqdm(file_paths, desc="Prep", unit="file"):
+        console.print("Preparing chunk lists for partial updates...", style="bold")
+        for fpath in tqdm(file_paths, desc="Preparing", unit="file"):
             old_chunk_map = get_existing_chunks_for_file(db, fpath)
 
             try:
@@ -489,10 +499,10 @@ def main():
 
             tasks.append((fpath, splitted, old_chunk_map))
 
-        console.print("Starting worker threads for partial chunk updates...\n", style="bold")
+        console.print("Starting file indexing in multiple threads...\n", style="bold")
 
         task_queue = queue.Queue(maxsize=QUEUE_SIZE)
-        pbar = tqdm(total=len(tasks), desc="Indexing files", unit="file")
+        pbar = tqdm(total=len(tasks), desc="Indexing", unit="file")
         workers = []
 
         for _ in range(NUM_WORKERS):
@@ -503,7 +513,7 @@ def main():
         for item in tasks:
             task_queue.put(item)
 
-        # Signal end
+        # End signal
         for _ in range(NUM_WORKERS):
             task_queue.put(None)
 
@@ -515,27 +525,18 @@ def main():
         console.print(
             f"Partial indexing complete!\n"
             f"Index name: [khaki1]{index_name}[/khaki1]\n"
-            f"Stored in: [spring_green2]{persist_dir}[/spring_green2]\n",
+            f"Location: [spring_green2]{persist_dir}[/spring_green2]\n",
             style="bold"
         )
-        console.print("You can now run [italic]ask.py[/italic] for Q&A on this index.\n", style="dim")
+        console.print("You can now run [italic]ask.py[/italic] to query your code.\n", style="dim")
         indexing_in_progress = False
 
     except KeyboardInterrupt:
         console.print("\nIndexing interrupted by user.", style="bold red")
-        # If incomplete, do NOT remove the entire folder if we want partial updates later
-        # (But if you prefer cleaning up, uncomment below)
-        # if indexing_in_progress and persist_dir and os.path.isdir(persist_dir):
-        #     console.print(f"Removing incomplete index folder: {persist_dir}", style="bold red")
-        #     shutil.rmtree(persist_dir, ignore_errors=True)
         sys.exit(1)
 
     except Exception as e:
         console.print(f"\nAn error occurred: {e}", style="bold red")
-        # Same logic about cleanup; can be commented out if partial data is still useful
-        # if indexing_in_progress and persist_dir and os.path.isdir(persist_dir):
-        #     console.print(f"Removing incomplete index folder: {persist_dir}", style="bold red")
-        #     shutil.rmtree(persist_dir, ignore_errors=True)
         sys.exit(1)
 
 
